@@ -1,11 +1,13 @@
+import uuid
 from random import choices, randint
-from fastapi import Request
+from fastapi import Request, HTTPException
 from datetime import datetime
 import json
 
 from aiomysql import Pool
 
 from kafka.constant.constant_config import ANALYSIS_REQUEST_TOPIC
+from marketing.controller.request_form.update_request_form import UpdateRequestForm
 from marketing.entity.marketing_data import MarketingData
 from marketing.entity.campaign_type import CampaignType
 from marketing.entity.gender import Gender
@@ -64,6 +66,11 @@ class MarketingServiceImpl(MarketingService):
         )
 
     async def generateVirtualMarketingData(self):
+        virtual_data = self.__generateSingle()
+        await self.marketingRepository.create(virtual_data)
+        return {"status": "success", "data": virtual_data}
+
+    async def generateVirtualMarketingDataSet(self):
         virtual_data_list = [self.__generateSingle() for _ in range(100)]
         await self.marketingRepository.bulkCreate(virtual_data_list)
         return {"status": "success", "count": len(virtual_data_list)}
@@ -86,8 +93,9 @@ class MarketingServiceImpl(MarketingService):
             serialized_data = [self.__serialize(data) for data in marketing_data_list]
 
             # 3. 메시지 구성
+            request_id = f"analysis_{uuid.uuid4()}"  # UUID 생성
             analysis_message = {
-                "request_id": "analysis_" + str(randint(100000, 999999)),
+                "request_id": request_id,
                 "analysis_type": "CTR_CVR_SUMMARY",
                 "timestamp": datetime.utcnow().isoformat(),
                 "data": serialized_data
@@ -96,9 +104,13 @@ class MarketingServiceImpl(MarketingService):
             # 4. Kafka 프로듀서
             kafka_producer = self.httpRequest.app.state.kafka_producer
             await kafka_producer.send_and_wait(
-                ANALYSIS_REQUEST_TOPIC,
+                "marketing.analysis.request",
                 json.dumps(analysis_message).encode("utf-8")
             )
+
+            # # 5. Redis 상태 저장 (queued)
+            # redis = self.httpRequest.app.state.redis
+            # await redis.set(f"analysis_status:{request_id}", "queued")
 
             return {
                 "success": True,
@@ -113,3 +125,41 @@ class MarketingServiceImpl(MarketingService):
                 "message": "분석 요청 처리 중 오류 발생",
                 "error": str(e)
             }
+
+    async def requestDataList(self):
+        dataList = await self.marketingRepository.findAll()
+        return [data.to_dict() for data in dataList]
+
+    async def readVirtualMarketingData(self, customer_id: int):
+        data = await self.marketingRepository.findById(customer_id)
+        if not data:
+            raise ValueError(f"데이터 없음: customer_id={customer_id}")
+
+        return {
+            "customer_id": data.customer_id,
+            "age": data.age,
+            "gender": data.gender.value,
+            "campaign_type": data.campaign_type.value,
+            "user_response": data.user_response.value,
+        }
+
+    async def updateVirtualMarketingData(self, form: UpdateRequestForm) -> int:
+        existing = await self.marketingRepository.findById(form.customer_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="해당 고객 데이터를 찾을 수 없습니다.")
+
+        updated = MarketingData(
+            customer_id=existing.customer_id,
+            age=form.age if form.age is not None else existing.age,
+            gender=form.gender if form.gender is not None else existing.gender,
+            campaign_type=form.campaign_type if form.campaign_type is not None else existing.campaign_type,
+            user_response=form.user_response if form.user_response is not None else existing.user_response
+        )
+
+        return await self.marketingRepository.update(updated)
+
+    async def removeVirtualMarketingData(self, customer_id: int) -> int:
+        existing = await self.marketingRepository.findById(customer_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="해당 마케팅 데이터를 찾을 수 없습니다.")
+        return await self.marketingRepository.deleteById(customer_id)
